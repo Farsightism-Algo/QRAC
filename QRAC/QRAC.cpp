@@ -58,10 +58,20 @@ struct QRACConfig {
     float TEXT_DETECTION_THRESHOLD = 0.85f; // 文本检测阈值
     float CONTROL_CHAR_THRESHOLD = 0.05f; // 控制字符阈值
     bool USE_ADVANCED_FEC = false; // 使用简单FEC而不是Reed-Solomon
+    uint8_t DAMAGE_THRESHOLD = 3; // 损伤判定阈值
 };
 
 // 全局配置实例
 QRACConfig g_config;
+
+// 验证像素颜色定义
+const uint8_t VERIFICATION_COLORS[5][3] = {
+    {255, 0, 0},   // 完全红
+    {0, 0, 255},   // 完全蓝
+    {0, 255, 0},   // 完全绿
+    {255, 255, 0}, // 完全黄
+    {255, 255, 255} // 完全白
+};
 
 // 计算间隔数量
 int calculateIntervals() {
@@ -80,7 +90,8 @@ enum class ErrorType {
     DataSizeError,
     FECError,
     UserAbort,
-    InvalidInput
+    InvalidInput,
+    DamageExceeded
 };
 
 // 自定义异常类
@@ -128,17 +139,17 @@ int decodeToSymbol(uint8_t pixelValue) {
     if (isFillerValue(pixelValue)) {
         return -1; // 特殊值，表示填充区域
     }
-
+    
     // 跳过0-10的范围，从11开始计算
     int adjustedValue = pixelValue - (g_config.FILLER_MAX_VALUE + 1);
     int intervals = calculateIntervals();
     int intervalIndex = adjustedValue / g_config.L;
-
+    
     // 确保在有效范围内
     if (intervalIndex >= intervals) {
         intervalIndex = intervals - 1;
     }
-
+    
     return intervalIndex;
 }
 
@@ -162,7 +173,7 @@ void addFEC(std::vector<uint8_t>& data) {
     }
 }
 
-// 简单的FEC解码
+// 简单的FEC解码和纠正
 bool verifyAndCorrectFEC(std::vector<uint8_t>& data) {
     if (data.size() < 5) {
         return true; // 数据太小，无法进行FEC校正
@@ -210,12 +221,12 @@ bool verifyAndCorrectFEC(std::vector<uint8_t>& data) {
             for (size_t j = 0; j < 8; j++) {
                 size_t index = (j * fecSize + i) % originalSize;
                 uint8_t originalByte = correctedData[index];
-
+                
                 // 尝试翻转每个位
                 for (int bit = 0; bit < 8; bit++) {
                     uint8_t testByte = originalByte ^ (1 << bit);
                     uint8_t testFEC = calculatedFEC ^ originalByte ^ testByte;
-
+                    
                     if (testFEC == data[originalSize + i]) {
                         correctedData[index] = testByte;
                         std::cout << "Corrected byte error at position " << index << "\n";
@@ -290,14 +301,16 @@ std::vector<int> binaryToSymbols(const std::vector<bool>& binaryStream, int bits
     return symbols;
 }
 
-// Improved QRAC image creation function with filler value for unused areas
+// Improved QRAC image creation function with filler value for unused areas and verification pixels
 std::vector<uint8_t> createQRACImage(const std::vector<int>& symbols, int width, int height, bool useFEC) {
     int totalPixels = width * height;
     int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
 
+    // 考虑最后5个像素用于验证，不存储数据
+    int dataPixels = totalPixels - 5;
     int requiredPixels = (static_cast<int>(symbols.size()) + symbolsPerPixel - 1) / symbolsPerPixel;
 
-    if (requiredPixels > totalPixels) {
+    if (requiredPixels > dataPixels) {
         throw QRACException(ErrorType::ImageSizeError, "Image dimensions too small to contain all data");
     }
 
@@ -322,6 +335,14 @@ std::vector<uint8_t> createQRACImage(const std::vector<int>& symbols, int width,
         for (int ch = 0; ch < symbolsPerPixel && (i + ch) < static_cast<int>(symbols.size()); ch++) {
             int symbol = symbols[i + ch];
             imageData[dataIndex + ch] = calculateAnchor(symbol);
+        }
+    }
+
+    // 在图像末尾添加验证像素
+    int verificationStart = (totalPixels - 5) * channels;
+    for (int i = 0; i < 5; i++) {
+        for (int ch = 0; ch < 3; ch++) {
+            imageData[verificationStart + i * channels + ch] = VERIFICATION_COLORS[i][ch];
         }
     }
 
@@ -382,6 +403,54 @@ std::vector<uint8_t> binaryToData(const std::vector<bool>& binaryStream) {
     }
 
     return data;
+}
+
+// 检查验证像素损伤
+bool checkVerificationPixels(const uint8_t* imageData, int width, int height, int channels) {
+    int totalPixels = width * height;
+    int verificationStart = (totalPixels - 5) * channels;
+    
+    int totalDamage = 0;
+    bool damageExceeded = false;
+    
+    std::cout << "Verification pixel analysis:\n";
+    
+    for (int i = 0; i < 5; i++) {
+        int pixelStart = verificationStart + i * channels;
+        
+        // 计算每个通道的偏差
+        int damage = 0;
+        for (int ch = 0; ch < 3; ch++) {
+            int expected = VERIFICATION_COLORS[i][ch];
+            int actual = imageData[pixelStart + ch];
+            int diff = std::abs(actual - expected);
+            damage += diff;
+            
+            if (diff > g_config.DAMAGE_THRESHOLD) {
+                std::cout << "  Pixel " << i << " (";
+                switch (i) {
+                    case 0: std::cout << "Red"; break;
+                    case 1: std::cout << "Blue"; break;
+                    case 2: std::cout << "Green"; break;
+                    case 3: std::cout << "Yellow"; break;
+                    case 4: std::cout << "White"; break;
+                }
+                std::cout << "): Channel " << ch << " damage " << diff 
+                         << " exceeds threshold " << g_config.DAMAGE_THRESHOLD << "\n";
+            }
+        }
+        
+        totalDamage += damage;
+        
+        if (damage > g_config.DAMAGE_THRESHOLD * 3) { // 每个像素3个通道
+            damageExceeded = true;
+        }
+    }
+    
+    std::cout << "Total verification pixel damage: " << totalDamage << "\n";
+    std::cout << "Damage threshold per channel: " << static_cast<int>(g_config.DAMAGE_THRESHOLD) << "\n";
+    
+    return !damageExceeded;
 }
 
 // Determine if data is text
@@ -487,9 +556,9 @@ void calculateAdaptiveDimensions(size_t dataSize, int* width, int* height) {
     // 计算所需的总符号数（包括FEC）
     size_t totalSymbols = (dataSize * 8 + bitsPerSymbol - 1) / bitsPerSymbol;
 
-    // 计算所需像素数（每个像素存储3个符号）
+    // 计算所需像素数（每个像素存储3个符号，再加5个验证像素）
     int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
-    int pixelsNeeded = static_cast<int>((totalSymbols + symbolsPerPixel - 1) / symbolsPerPixel); // 向上取整
+    int pixelsNeeded = static_cast<int>((totalSymbols + symbolsPerPixel - 1) / symbolsPerPixel) + 5; // 加上验证像素
 
     // 找到能容纳像素的最小正方形
     int side = static_cast<int>(std::ceil(std::sqrt(pixelsNeeded)));
@@ -540,13 +609,13 @@ using STBImagePtr = std::unique_ptr<unsigned char, STBImageDeleter>;
 #ifdef _WIN32
 std::wstring utf8ToWstring(const std::string& utf8Str) {
     if (utf8Str.empty()) return std::wstring();
-
+    
     int wideStrLen = MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, nullptr, 0);
     if (wideStrLen == 0) return std::wstring();
-
+    
     std::wstring wideStr(wideStrLen, 0);
     MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, &wideStr[0], wideStrLen);
-
+    
     return wideStr;
 }
 #endif
@@ -554,7 +623,7 @@ std::wstring utf8ToWstring(const std::string& utf8Str) {
 // 使用stb_image加载图像
 STBImagePtr loadImageSTB(const std::string& filename, int* width, int* height, int* channels, int desired_channels = 0) {
     // 将UTF-8字符串转换为宽字符串（Windows需要）
-#ifdef _WIN32
+    #ifdef _WIN32
     std::wstring wideStr = utf8ToWstring(filename);
     // 使用宽字符版本的文件打开函数
     FILE* file = _wfopen(wideStr.c_str(), L"rb");
@@ -563,20 +632,20 @@ STBImagePtr loadImageSTB(const std::string& filename, int* width, int* height, i
     }
     unsigned char* data = stbi_load_from_file(file, width, height, channels, desired_channels);
     fclose(file);
-#else
+    #else
     unsigned char* data = stbi_load(filename.c_str(), width, height, channels, desired_channels);
-#endif
+    #endif
     return STBImagePtr(data);
 }
 
 // 简单的JPG文件检测函数（仅检测文件头）
 bool isJPGFile(const std::string& filename) {
-#ifdef _WIN32
+    #ifdef _WIN32
     std::wstring wideStr = utf8ToWstring(filename);
     std::ifstream file(wideStr, std::ios::binary);
-#else
+    #else
     std::ifstream file(filename, std::ios::binary);
-#endif
+    #endif
     if (!file.is_open()) {
         return false;
     }
@@ -609,23 +678,23 @@ void showJPGWarning() {
 
 // Check if file exists
 bool fileExists(const std::string& filename) {
-#ifdef _WIN32
+    #ifdef _WIN32
     std::wstring wideStr = utf8ToWstring(filename);
     return fs::exists(wideStr) && fs::is_regular_file(wideStr);
-#else
+    #else
     return fs::exists(filename) && fs::is_regular_file(filename);
-#endif
+    #endif
 }
 
 // Get file size
 size_t getFileSize(const std::string& filename) {
     try {
-#ifdef _WIN32
+        #ifdef _WIN32
         std::wstring wideStr = utf8ToWstring(filename);
         return fs::file_size(wideStr);
-#else
+        #else
         return fs::file_size(filename);
-#endif
+        #endif
     }
     catch (...) {
         throw QRACException(ErrorType::FileReadError, "无法获取文件大小: " + filename);
@@ -667,12 +736,12 @@ void showTrustStatement() {
 
 // 改进的文件保存逻辑
 void saveExtractedData(const std::vector<uint8_t>& data, const std::string& filename, bool isText) {
-#ifdef _WIN32
+    #ifdef _WIN32
     std::wstring wideStr = utf8ToWstring(filename);
     std::ofstream outFile(wideStr, isText ? std::ios::out : std::ios::binary);
-#else
+    #else
     std::ofstream outFile(filename, isText ? std::ios::out : std::ios::binary);
-#endif
+    #endif
     if (!outFile.is_open()) {
         throw QRACException(ErrorType::FileWriteError, "Cannot create output file: " + filename);
     }
@@ -816,12 +885,12 @@ void encodeFile() {
     }
 
     // Read input file
-#ifdef _WIN32
+    #ifdef _WIN32
     std::wstring wideStr = utf8ToWstring(inputFile);
     std::ifstream file(wideStr, std::ios::binary);
-#else
+    #else
     std::ifstream file(inputFile, std::ios::binary);
-#endif
+    #endif
     if (!file.is_open()) {
         throw QRACException(ErrorType::FileReadError, "Cannot open input file: " + inputFile);
     }
@@ -883,21 +952,23 @@ void encodeFile() {
     std::vector<int> symbols = binaryToSymbols(binaryStream, bitsPerSymbol);
     std::cout << "Generated symbol sequence: " << symbols.size() << " symbols\n";
 
-    // Check if image is large enough
+    // Check if image is large enough (考虑5个验证像素)
     int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
     int totalPixels = width * height;
+    int dataPixels = totalPixels - 5; // 减去验证像素
     int requiredPixels = (static_cast<int>(symbols.size()) + symbolsPerPixel - 1) / symbolsPerPixel;
 
-    if (requiredPixels > totalPixels) {
+    if (requiredPixels > dataPixels) {
         std::cout << "Warning: Image dimensions (" << width << "x" << height << ") may be too small for "
             << symbols.size() << " symbols\n";
-        std::cout << "Required pixels: " << requiredPixels << ", Available pixels: " << totalPixels << "\n";
+        std::cout << "Required pixels: " << requiredPixels << ", Available pixels: " << dataPixels << "\n";
         std::cout << "Consider using a larger mode or adaptive mode\n";
     }
 
-    // Create QRAC image
+    // Create QRAC image with verification pixels
     std::vector<uint8_t> imageData = createQRACImage(symbols, width, height, useFEC);
     std::cout << "Generated image data: " << imageData.size() << " bytes\n";
+    std::cout << "Added 5 verification pixels at image end for damage detection\n";
 
     // Generate output filename
     std::string outputImage = generateOutputFilename(inputFile, "_encoded", outputFormat);
@@ -911,36 +982,37 @@ void encodeFile() {
         if (compressedData.size() > maxSizeKB * 1024) {
             std::cout << "Warning: PNG file still exceeds " << maxSizeKB << "KB after compression. Data may be hard to compress.\n";
         }
-#ifdef _WIN32
+        #ifdef _WIN32
         std::wstring wideOutput = utf8ToWstring(outputImage);
         std::ofstream outFile(wideOutput, std::ios::binary);
-#else
+        #else
         std::ofstream outFile(outputImage, std::ios::binary);
-#endif
+        #endif
         outFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedData.size());
         outFile.close();
     }
     else {
         // BMP保存逻辑
-#ifdef _WIN32
+        #ifdef _WIN32
         std::wstring wideOutput = utf8ToWstring(outputImage);
         // 使用宽字符版本的文件保存
         if (!saveImage(outputImage, imageData.data(), width, height, 3, outputFormat)) {
             throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
         }
-#else
+        #else
         if (!saveImage(outputImage, imageData.data(), width, height, 3, outputFormat)) {
             throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
         }
-#endif
+        #endif
     }
 
     std::cout << "QRAC image saved: " << outputImage << "\n";
     std::cout << "Encoding complete! Output file is in the same directory as input.\n";
     std::cout << outputFormat << " format ensures lossless storage of your data.\n";
+    std::cout << "Verification pixels added for damage detection.\n";
 }
 
-// Decoder function
+// Decoder function - 移除了FEC纠错
 void decodeFile() {
     std::string inputImage;
 
@@ -988,12 +1060,30 @@ void decodeFile() {
 
     std::cout << "Loaded image: " << width << "x" << height << " pixels, " << channels << " channels\n";
 
-    // Calculate total symbols
-    int totalPixels = width * height;
-    int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
-    int totalSymbols = totalPixels * symbolsPerPixel;
+    // 检查验证像素损伤
+    std::cout << "Checking verification pixels for damage...\n";
+    bool damageAcceptable = checkVerificationPixels(imageData, width, height, channels);
+    
+    if (!damageAcceptable) {
+        std::cout << "Warning: Image damage exceeds threshold! Data may be corrupted.\n";
+        std::cout << "Proceed anyway? (y/n): ";
+        
+        char choice;
+        std::cin >> choice;
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        
+        if (choice != 'y' && choice != 'Y') {
+            throw QRACException(ErrorType::DamageExceeded, "Image damage too severe for decoding");
+        }
+    }
 
-    std::cout << "Storable symbols: " << totalSymbols << "\n";
+    // Calculate total symbols (排除最后5个验证像素)
+    int totalPixels = width * height;
+    int dataPixels = totalPixels - 5; // 排除验证像素
+    int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
+    int totalSymbols = dataPixels * symbolsPerPixel;
+
+    std::cout << "Storable symbols (excluding verification pixels): " << totalSymbols << "\n";
 
     // Calculate bits per symbol
     int intervals = calculateIntervals();
@@ -1001,11 +1091,11 @@ void decodeFile() {
     std::cout << "Number of intervals: " << intervals << " (L=" << g_config.L << ")\n";
     std::cout << "Bits per symbol: " << bitsPerSymbol << "\n";
 
-    // Extract symbols from image
+    // Extract symbols from image (排除验证像素)
     std::vector<int> symbols;
     symbols.reserve(totalSymbols);
 
-    for (int i = 0; i < totalPixels * channels; i += channels) {
+    for (int i = 0; i < dataPixels * channels; i += channels) {
         // 检查整个像素是否在填充颜色范围内（接近黑色）
         if (isFillerPixel(&imageData[i], channels)) {
             // 如果是填充颜色，则添加填充符号
@@ -1035,13 +1125,8 @@ void decodeFile() {
     std::vector<uint8_t> extractedData = binaryToData(binaryStream);
     std::cout << "Extracted data: " << extractedData.size() << " bytes\n";
 
-    // Apply FEC error correction
-    bool dataValid = verifyAndCorrectFEC(extractedData);
-    std::cout << "Data after FEC correction: " << extractedData.size() << " bytes\n";
-
-    if (!dataValid) {
-        std::cout << "Warning: Data may contain uncorrectable errors\n";
-    }
+    // 注意：解码时不再进行FEC纠错，这将在校正功能中完成
+    std::cout << "Note: FEC error correction will be performed in correction mode if needed.\n";
 
     // Determine output file type
     std::string fileType = detectFileType(extractedData);
@@ -1055,7 +1140,7 @@ void decodeFile() {
 
     std::cout << "Data extracted to: " << outputFile << "\n";
     std::cout << "Decoding complete! Output file is in the same directory as input.\n";
-    std::cout << "Extraction " << (dataValid ? "successful" : "partially successful, may contain errors") << "\n";
+    std::cout << "If data appears corrupted, try using the Correction mode.\n";
 }
 
 // 将图像数据转换为32位BMP（添加Alpha通道）
@@ -1079,21 +1164,78 @@ std::vector<uint8_t> convertTo32BitBMP(const std::vector<uint8_t>& imageData, in
 STBImagePtr loadImageWithFallback(const std::string& filename, int* width, int* height, int* channels) {
     // 首先尝试正常加载
     STBImagePtr imageData = loadImageSTB(filename, width, height, channels, 0);
-
+    
     if (!imageData) {
         // 如果正常加载失败，尝试强制转换为3通道
         imageData = loadImageSTB(filename, width, height, channels, 3);
-
+        
         if (!imageData) {
-            throw QRACException(ErrorType::ImageLoadError,
+            throw QRACException(ErrorType::ImageLoadError, 
                 "无法加载图像文件。请确保文件是有效的PNG、BMP或PPM格式，并且没有被压缩。");
         }
     }
-
+    
     return imageData;
 }
 
-// Corrector function - 改进版本，正确处理填充值
+// 从图像中提取数据（不进行FEC纠错）
+std::vector<uint8_t> extractDataFromImage(const uint8_t* imageData, int width, int height, int channels, bool& damageAcceptable) {
+    // 检查验证像素损伤
+    std::cout << "Checking verification pixels for damage...\n";
+    damageAcceptable = checkVerificationPixels(imageData, width, height, channels);
+    
+    if (!damageAcceptable) {
+        std::cout << "Warning: Image damage exceeds threshold! Correction may not be possible.\n";
+    }
+
+    // 提取数据（排除最后5个验证像素）
+    int totalPixels = width * height;
+    int dataPixels = totalPixels - 5; // 排除验证像素
+    int symbolsPerPixel = g_config.SYMBOLS_PER_PIXEL;
+    int totalSymbols = dataPixels * symbolsPerPixel;
+
+    // Calculate bits per symbol
+    int intervals = calculateIntervals();
+    int bitsPerSymbol = static_cast<int>(std::log2(intervals));
+
+    // Extract symbols from image (排除验证像素)
+    std::vector<int> symbols;
+    symbols.reserve(totalSymbols);
+
+    for (int i = 0; i < dataPixels * channels; i += channels) {
+        // 检查整个像素是否在填充颜色范围内（接近黑色）
+        if (isFillerPixel(&imageData[i], channels)) {
+            // 如果是填充颜色，则添加填充符号
+            for (int ch = 0; ch < symbolsPerPixel; ch++) {
+                symbols.push_back(-1);
+            }
+        }
+        else {
+            for (int ch = 0; ch < symbolsPerPixel; ch++) {
+                uint8_t pixelValue = imageData[i + ch];
+                int symbol = decodeToSymbol(pixelValue);
+                symbols.push_back(symbol);
+            }
+        }
+    }
+
+    std::cout << "Extracted symbols: " << symbols.size() << " symbols\n";
+
+    // Calculate expected data bits
+    size_t expectedBits = totalSymbols * bitsPerSymbol;
+
+    // Convert symbols to binary stream
+    std::vector<bool> binaryStream = symbolsToBinary(symbols, bitsPerSymbol, expectedBits);
+    std::cout << "Extracted binary stream: " << binaryStream.size() << " bits\n";
+
+    // Convert binary stream to byte data
+    std::vector<uint8_t> extractedData = binaryToData(binaryStream);
+    std::cout << "Extracted data: " << extractedData.size() << " bytes\n";
+
+    return extractedData;
+}
+
+// Corrector function - 改进版本，集成FEC纠错并重新编码
 void correctImageFile() {
     std::string inputImage;
 
@@ -1138,126 +1280,87 @@ void correctImageFile() {
 
     std::cout << "Loaded image: " << width << "x" << height << " pixels, " << channels << " channels\n";
 
-    // Check if correction is needed
-    int totalPixels = width * height;
-    int incorrectPixels = 0;
-    int fillerPixels = 0;
-
-    for (int i = 0; i < totalPixels * channels; i += channels) {
-        // 检查整个像素是否在填充颜色范围内（接近黑色）
-        if (isFillerPixel(&imageData[i], channels)) {
-            fillerPixels++;
-            continue;
-        }
-
-        // 检查每个通道是否需要校正
-        for (int ch = 0; ch < 3; ch++) {
-            uint8_t pixelValue = imageData[i + ch];
-            int intervalIndex = decodeToSymbol(pixelValue);
-
-            // 跳过填充值
-            if (intervalIndex == -1) continue;
-
-            uint8_t anchorValue = calculateAnchor(intervalIndex);
-
-            if (pixelValue != anchorValue) {
-                incorrectPixels++;
-            }
-        }
+    // 提取数据并检查损伤
+    bool damageAcceptable;
+    std::vector<uint8_t> extractedData = extractDataFromImage(imageData, width, height, channels, damageAcceptable);
+    
+    if (!damageAcceptable) {
+        std::cout << "Image damage exceeds threshold. Attempting correction anyway...\n";
     }
 
-    float incorrectRatio = static_cast<float>(incorrectPixels) / (totalPixels * 3 - fillerPixels * 3);
-    std::cout << "Detected " << incorrectPixels << " pixel values deviating from anchors ("
-        << std::fixed << std::setprecision(2) << incorrectRatio * 100 << "%)\n";
-    std::cout << "Found " << fillerPixels << " filler pixels (will be set to pure black)\n";
-
-    if (incorrectPixels == 0 && fillerPixels == 0) {
-        std::cout << "Image is already in anchor-pure state, no correction needed\n";
-
-        // Generate output filename
-        std::string outputImage = generateOutputFilename(inputImage, "_corrected", "bmp");
-
-        // 转换为32位BMP
-        std::vector<uint8_t> bmpData = convertTo32BitBMP(
-            std::vector<uint8_t>(imageData, imageData + totalPixels * channels),
-            width, height, channels
-        );
-
-        // 直接保存为BMP
-#ifdef _WIN32
-        std::wstring wideOutput = utf8ToWstring(outputImage);
-        if (!saveImage(outputImage, bmpData.data(), width, height, 4, "bmp")) {
-            throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
+    // 第一步：尝试FEC纠错
+    std::cout << "\nStep 1: Performing FEC error correction...\n";
+    bool fecSuccess = verifyAndCorrectFEC(extractedData);
+    
+    if (!fecSuccess) {
+        std::cout << "FEC correction failed. Image may be too damaged to repair.\n";
+        std::cout << "Continue with partial correction? (y/n): ";
+        
+        char choice;
+        std::cin >> choice;
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        
+        if (choice != 'y' && choice != 'Y') {
+            throw QRACException(ErrorType::FECError, "FEC correction failed, user cancelled operation");
         }
-#else
-        if (!saveImage(outputImage, bmpData.data(), width, height, 4, "bmp")) {
-            throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
-        }
-#endif
-
-        std::cout << "Image saved: " << outputImage << "\n";
-        std::cout << "Correction complete! Image was already pure, no changes made.\n";
     }
-    else {
-        // Perform correction
-        std::cout << "Performing correction...\n";
-        std::vector<uint8_t> correctedData(totalPixels * channels);
+    
+    std::cout << "Data after FEC correction: " << extractedData.size() << " bytes\n";
 
-        for (int i = 0; i < totalPixels * channels; i += channels) {
-            // 检查整个像素是否在填充颜色范围内（接近黑色）
-            if (isFillerPixel(&imageData[i], channels)) {
-                // 如果是填充颜色，设置为纯黑色
-                correctedData[i] = 0;
-                correctedData[i + 1] = 0;
-                correctedData[i + 2] = 0;
-                if (channels > 3) {
-                    correctedData[i + 3] = imageData[i + 3]; // 保留Alpha通道
-                }
-                continue;
-            }
+    // 第二步：像素锚定和重新编码
+    std::cout << "\nStep 2: Re-encoding data with anchor values...\n";
+    
+    // 转换数据为二进制流
+    std::vector<bool> binaryStream = dataToBinary(extractedData);
+    std::cout << "Binary stream: " << binaryStream.size() << " bits\n";
 
-            // 校正每个通道
-            for (int ch = 0; ch < 3; ch++) {
-                uint8_t pixelValue = imageData[i + ch];
-                int intervalIndex = decodeToSymbol(pixelValue);
+    // 计算每个符号的位数
+    int intervals = calculateIntervals();
+    int bitsPerSymbol = static_cast<int>(std::log2(intervals));
+    std::cout << "Bits per symbol: " << bitsPerSymbol << "\n";
 
-                if (intervalIndex == -1) {
-                    // 如果是填充值，设置为纯黑色
-                    correctedData[i + ch] = 0;
-                }
-                else {
-                    correctedData[i + ch] = calculateAnchor(intervalIndex);
-                }
-            }
+    // 转换二进制流为符号序列
+    std::vector<int> symbols = binaryToSymbols(binaryStream, bitsPerSymbol);
+    std::cout << "Symbol sequence: " << symbols.size() << " symbols\n";
 
-            // 保留Alpha通道（如果有）
-            if (channels > 3) {
-                correctedData[i + 3] = imageData[i + 3];
-            }
-        }
+    // 创建新的QRAC图像（包含验证像素）
+    bool useFEC = true;
+    std::vector<uint8_t> correctedImageData = createQRACImage(symbols, width, height, useFEC);
+    std::cout << "Generated corrected image data: " << correctedImageData.size() << " bytes\n";
 
-        // Generate output filename
-        std::string outputImage = generateOutputFilename(inputImage, "_corrected", "bmp");
+    // 第三步：保存校正后的图像
+    std::cout << "\nStep 3: Saving corrected image...\n";
+    
+    // 生成输出文件名
+    std::string outputImage = generateOutputFilename(inputImage, "_corrected", "png");
 
-        // 转换为32位BMP
-        std::vector<uint8_t> bmpData = convertTo32BitBMP(correctedData, width, height, channels);
+    // 对图像进行无损压缩
+    std::cout << "Applying lossless compression to corrected image...\n";
+    std::vector<uint8_t> compressedData = compressImage(correctedImageData, width, height, 3);
+    std::cout << "Compressed image data: " << compressedData.size() << " bytes\n";
 
-        // 保存为BMP格式
-#ifdef _WIN32
-        std::wstring wideOutput = utf8ToWstring(outputImage);
-        if (!saveImage(outputImage, bmpData.data(), width, height, 4, "bmp")) {
-            throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
-        }
-#else
-        if (!saveImage(outputImage, bmpData.data(), width, height, 4, "bmp")) {
-            throw QRACException(ErrorType::ImageSaveError, "Failed to save output image");
-        }
-#endif
-
-        std::cout << "Corrected image saved: " << outputImage << "\n";
-        std::cout << "Correction complete! Output file is in the same directory as input.\n";
-        std::cout << "BMP format ensures lossless storage of your data.\n";
+    #ifdef _WIN32
+    std::wstring wideOutput = utf8ToWstring(outputImage);
+    std::ofstream outFile(wideOutput, std::ios::binary);
+    #else
+    std::ofstream outFile(outputImage, std::ios::binary);
+    #endif
+    
+    if (!outFile.is_open()) {
+        throw QRACException(ErrorType::FileWriteError, "Cannot create output file: " + outputImage);
     }
+    
+    outFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedData.size());
+    outFile.close();
+
+    std::cout << "Corrected image saved: " << outputImage << "\n";
+    std::cout << "Correction complete! Image has been repaired and re-encoded.\n";
+    std::cout << "Process summary:\n";
+    std::cout << "  1. Extracted data from damaged image\n";
+    std::cout << "  2. Applied FEC error correction: " << (fecSuccess ? "Success" : "Partial success") << "\n";
+    std::cout << "  3. Re-encoded data with proper anchor values\n";
+    std::cout << "  4. Added verification pixels for future damage detection\n";
+    std::cout << "  5. Saved as PNG format for lossless storage\n";
 }
 
 // Main menu
@@ -1338,6 +1441,9 @@ void showMenu() {
             case ErrorType::UserAbort:
                 std::cerr << "Operation cancelled by user.\n";
                 break;
+            case ErrorType::DamageExceeded:
+                std::cerr << "Image damage is too severe. Try using the Correction mode.\n";
+                break;
             default:
                 break;
             }
@@ -1350,14 +1456,12 @@ void showMenu() {
 
 // Main function
 int main() {
-    std::cout << "QRAC Integrated Tool Suite - Version 4.0\n";
-    std::cout << "Now with improved error correction and 0-10 range skipping\n";
+    std::cout << "QRAC Integrated Tool Suite - Version 5.0\n";
+    std::cout << "Now with integrated FEC correction and damage detection\n";
+    std::cout << "Added verification pixels for image damage assessment\n";
     std::cout << "Supports Word documents, text files, and compressed archives\n";
     std::cout << "Improved Chinese/UTF-8 text support\n";
     std::cout << "Uses stb_image for better format compatibility\n\n";
-    std::cout << "版权所有 (c) 2024 xuehaoyu chen\n";
-    std::cout << "基于MIT许可证开源\n";
-    std::cout << "GitHub: https://github.com/sans666VIP\n\n";
 
     try {
         showMenu();
