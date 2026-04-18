@@ -1,6 +1,6 @@
 ﻿/******************************************************************
  * QRAC - Quantitative Random Access Codes
- * Copyright (c) 2024 Xuehaoyu Chen. 保留所有权利.
+ * Copyright (c) 2026 Xuehaoyu Chen. 保留所有权利.
  *
  * 本软件根据MIT许可证分发 - 详见LICENSE文件
  * 项目地址: https://github.com/sans666VIP/QRAC
