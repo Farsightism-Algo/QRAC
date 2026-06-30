@@ -33,7 +33,7 @@
 ## 作者
 
 **xuehaoyu chen**
-- GitHub: [sans666VIP]
+- GitHub: [Farsightism-Algo]
 
 ## 致谢
 
