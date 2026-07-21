@@ -44,13 +44,14 @@ namespace fs = std::filesystem;
 #ifdef _WIN32
 #include <windows.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #endif
 
 // ============================================================
 // 版本信息
 // ============================================================
-constexpr int QRAC_FORMAT_VERSION = 1;   // 图像格式版本（写入 header byte 8）
-const char*   QRAC_SOFTWARE_VER   = "5.3";
+constexpr int QRAC_FORMAT_VERSION = 1;
+const char* QRAC_SOFTWARE_VER = "5.3";
 
 // ============================================================
 // 原生文件对话框（跨平台，无第三方依赖）
@@ -64,7 +65,7 @@ std::string nativeOpenFileDialog(const char* filterPattern = nullptr) {
         ? filterPattern
         : "All Files\0*.*\0QRAC Images\0*.png;*.bmp;*.jpg;*.jpeg\0\0";
     ofn.lpstrFile = buf;
-    ofn.nMaxFile  = sizeof(buf);
+    ofn.nMaxFile = sizeof(buf);
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     if (GetOpenFileNameA(&ofn)) return std::string(buf);
     return {};
@@ -92,15 +93,15 @@ std::string nativeSaveFileDialog(const char* defaultName = "output.png") {
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFilter = "PNG\0*.png\0BMP\0*.bmp\0All\0*.*\0\0";
     ofn.lpstrFile = buf;
-    ofn.nMaxFile  = sizeof(buf);
+    ofn.nMaxFile = sizeof(buf);
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     ofn.nFilterIndex = 1;
     if (GetSaveFileNameA(&ofn)) return std::string(buf);
     return {};
 #else
     std::string cmd = "zenity --file-selection --save --confirm-overwrite"
-                      " --title=\"Save File\" --filename=\"" +
-                      std::string(defaultName) + "\" 2>/dev/null";
+        " --title=\"Save File\" --filename=\"" +
+        std::string(defaultName) + "\" 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return {};
     char buf[4096] = {};
@@ -121,7 +122,7 @@ std::string nativeOpenFolderDialog() {
     char buf[MAX_PATH * 4] = {};
     BROWSEINFOA bi = {};
     bi.lpszTitle = "Select folder containing files to encode";
-    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
     if (pidl) {
         SHGetPathFromIDListA(pidl, buf);
@@ -131,7 +132,7 @@ std::string nativeOpenFolderDialog() {
     return {};
 #else
     std::string cmd = "zenity --file-selection --directory"
-                      " --title=\"Select Folder\" 2>/dev/null";
+        " --title=\"Select Folder\" 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return {};
     char buf[4096] = {};
@@ -145,6 +146,36 @@ std::string nativeOpenFolderDialog() {
     return result;
 #endif
 }
+
+// ============================================================
+// 前向声明区 —— atomicWriteFile 依赖这些，必须定义在前面
+// ============================================================
+
+#ifdef _WIN32
+std::wstring utf8ToWstring(const std::string& s) {
+    if (s.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (!len) return {};
+    std::wstring ws(len, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &ws[0], len);
+    return ws;
+}
+#endif
+
+enum class ErrorType {
+    FileNotFound, FileReadError, FileWriteError,
+    ImageLoadError, ImageSaveError, ImageSizeError,
+    DataSizeError, FECError, UserAbort, InvalidInput, DamageExceeded
+};
+
+class QRACException : public std::runtime_error {
+public:
+    QRACException(ErrorType t, const std::string& m)
+        : std::runtime_error(m), m_type(t) {}
+    ErrorType getType() const { return m_type; }
+private:
+    ErrorType m_type;
+};
 
 // ============================================================
 // 日志系统：同时输出到控制台和文件
@@ -174,13 +205,13 @@ void closeLogFile() {
 // 原子文件写入：先写 .tmp，成功后再 rename
 // ============================================================
 void atomicWriteFile(const std::string& path,
-                     const void* data, size_t len,
-                     bool binary = true) {
+    const void* data, size_t len,
+    bool binary = true) {
     std::string tmpPath = path + ".tmp";
     {
 #ifdef _WIN32
         std::ofstream f(utf8ToWstring(tmpPath),
-                         binary ? std::ios::binary : std::ios::out);
+            binary ? std::ios::binary : std::ios::out);
 #else
         std::ofstream f(tmpPath, binary ? std::ios::binary : std::ios::out);
 #endif
@@ -198,7 +229,8 @@ void atomicWriteFile(const std::string& path,
     fs::rename(tmpPath, path, ec);
     if (ec) {
         // rename 失败时尝试清理
-        try { fs::remove(tmpPath); } catch (...) {}
+        try { fs::remove(tmpPath); }
+        catch (...) {}
         throw QRACException(ErrorType::FileWriteError,
             "Cannot finalize: " + path + " (" + ec.message() + ")");
     }
@@ -208,43 +240,43 @@ void atomicWriteFile(const std::string& path,
 // Config 持久化
 // ============================================================
 struct QRACConfig {
-    int   L                    = 5;
-    uint8_t FILLER_MAX_VALUE   = 10;
+    int   L = 5;
+    uint8_t FILLER_MAX_VALUE = 10;
     float FEC_REDUNDANCY_RATIO = 0.25f;
-    int   MIN_IMAGE_DIMENSION  = 16;
-    int   DEFAULT_SMALL_SIZE   = 128;
-    int   DEFAULT_MEDIUM_SIZE  = 512;
-    int   DEFAULT_LARGE_SIZE   = 1024;
-    size_t SMALL_FILE_THRESHOLD  = 96 * 1024;
+    int   MIN_IMAGE_DIMENSION = 16;
+    int   DEFAULT_SMALL_SIZE = 128;
+    int   DEFAULT_MEDIUM_SIZE = 512;
+    int   DEFAULT_LARGE_SIZE = 1024;
+    size_t SMALL_FILE_THRESHOLD = 96 * 1024;
     size_t MEDIUM_FILE_THRESHOLD = 1024 * 1024;
-    int   SYMBOLS_PER_PIXEL    = 3;
-    int   FEC_BLOCK_SIZE       = 10;
-    int   MAX_FEC_WARNINGS     = 15;
+    int   SYMBOLS_PER_PIXEL = 3;
+    int   FEC_BLOCK_SIZE = 10;
+    int   MAX_FEC_WARNINGS = 15;
     float TEXT_DETECTION_THRESHOLD = 0.85f;
-    float CONTROL_CHAR_THRESHOLD   = 0.05f;
-    bool  USE_ADVANCED_FEC     = false;
-    uint8_t DAMAGE_THRESHOLD   = 3;
+    float CONTROL_CHAR_THRESHOLD = 0.05f;
+    bool  USE_ADVANCED_FEC = false;
+    uint8_t DAMAGE_THRESHOLD = 3;
     // 运行时选项（不持久化到 header）
-    bool  verifyRoundtrip      = false;
-    size_t largeFileWarningMB  = 50;
+    bool  verifyRoundtrip = false;
+    size_t largeFileWarningMB = 50;
 };
 
 void saveConfig(const QRACConfig& cfg) {
     std::ofstream f("qrac_config.ini");
     if (!f.is_open()) return;
     f << "# QRAC Config - auto-generated\n"
-      << "L=" << cfg.L << "\n"
-      << "FILLER_MAX_VALUE=" << (int)cfg.FILLER_MAX_VALUE << "\n"
-      << "FEC_REDUNDANCY_RATIO=" << cfg.FEC_REDUNDANCY_RATIO << "\n"
-      << "DAMAGE_THRESHOLD=" << (int)cfg.DAMAGE_THRESHOLD << "\n"
-      << "MIN_IMAGE_DIMENSION=" << cfg.MIN_IMAGE_DIMENSION << "\n"
-      << "DEFAULT_SMALL_SIZE=" << cfg.DEFAULT_SMALL_SIZE << "\n"
-      << "DEFAULT_MEDIUM_SIZE=" << cfg.DEFAULT_MEDIUM_SIZE << "\n"
-      << "DEFAULT_LARGE_SIZE=" << cfg.DEFAULT_LARGE_SIZE << "\n"
-      << "SMALL_FILE_THRESHOLD=" << cfg.SMALL_FILE_THRESHOLD << "\n"
-      << "MEDIUM_FILE_THRESHOLD=" << cfg.MEDIUM_FILE_THRESHOLD << "\n"
-      << "verifyRoundtrip=" << (cfg.verifyRoundtrip ? 1 : 0) << "\n"
-      << "largeFileWarningMB=" << cfg.largeFileWarningMB << "\n";
+        << "L=" << cfg.L << "\n"
+        << "FILLER_MAX_VALUE=" << (int)cfg.FILLER_MAX_VALUE << "\n"
+        << "FEC_REDUNDANCY_RATIO=" << cfg.FEC_REDUNDANCY_RATIO << "\n"
+        << "DAMAGE_THRESHOLD=" << (int)cfg.DAMAGE_THRESHOLD << "\n"
+        << "MIN_IMAGE_DIMENSION=" << cfg.MIN_IMAGE_DIMENSION << "\n"
+        << "DEFAULT_SMALL_SIZE=" << cfg.DEFAULT_SMALL_SIZE << "\n"
+        << "DEFAULT_MEDIUM_SIZE=" << cfg.DEFAULT_MEDIUM_SIZE << "\n"
+        << "DEFAULT_LARGE_SIZE=" << cfg.DEFAULT_LARGE_SIZE << "\n"
+        << "SMALL_FILE_THRESHOLD=" << cfg.SMALL_FILE_THRESHOLD << "\n"
+        << "MEDIUM_FILE_THRESHOLD=" << cfg.MEDIUM_FILE_THRESHOLD << "\n"
+        << "verifyRoundtrip=" << (cfg.verifyRoundtrip ? 1 : 0) << "\n"
+        << "largeFileWarningMB=" << cfg.largeFileWarningMB << "\n";
 }
 
 void loadConfig(QRACConfig& cfg) {
@@ -270,16 +302,17 @@ void loadConfig(QRACConfig& cfg) {
             else if (k == "MEDIUM_FILE_THRESHOLD") cfg.MEDIUM_FILE_THRESHOLD = std::stoull(v);
             else if (k == "verifyRoundtrip") cfg.verifyRoundtrip = (std::stoi(v) != 0);
             else if (k == "largeFileWarningMB") cfg.largeFileWarningMB = std::stoull(v);
-        } catch (...) { /* 解析失败则保留默认值 */ }
+        }
+        catch (...) { /* 解析失败则保留默认值 */ }
     }
 }
 
 // ============================================================
 // 图像布局常量
 // ============================================================
-constexpr int HEADER_PIXELS       = 4;   // 前 4 像素 = 12 字节 header
-constexpr int VERIFICATION_PIXELS = 5;   // 末尾 5 像素 = 损伤检测
-constexpr int HEADER_BYTES        = HEADER_PIXELS * 3;
+constexpr int HEADER_PIXELS = 4;
+constexpr int VERIFICATION_PIXELS = 5;
+constexpr int HEADER_BYTES = HEADER_PIXELS * 3;
 
 /*
  * Header 字节布局 (12 bytes total):
@@ -323,15 +356,15 @@ uint32_t crc32(const uint8_t* data, size_t len) {
 
 void appendCRC32(std::vector<uint8_t>& data) {
     uint32_t cs = crc32(data.data(), data.size());
-    data.push_back((cs>>0)&0xFF); data.push_back((cs>>8)&0xFF);
-    data.push_back((cs>>16)&0xFF); data.push_back((cs>>24)&0xFF);
+    data.push_back((cs >> 0) & 0xFF); data.push_back((cs >> 8) & 0xFF);
+    data.push_back((cs >> 16) & 0xFF); data.push_back((cs >> 24) & 0xFF);
 }
 
 bool verifyAndStripCRC32(std::vector<uint8_t>& data) {
     if (data.size() < 4) return false;
     size_t pl = data.size() - 4;
-    uint32_t stored = (uint32_t)data[pl] | ((uint32_t)data[pl+1]<<8)
-                    | ((uint32_t)data[pl+2]<<16) | ((uint32_t)data[pl+3]<<24);
+    uint32_t stored = (uint32_t)data[pl] | ((uint32_t)data[pl + 1] << 8)
+        | ((uint32_t)data[pl + 2] << 16) | ((uint32_t)data[pl + 3] << 24);
     uint32_t computed = crc32(data.data(), pl);
     data.resize(pl);
     return stored == computed;
@@ -340,28 +373,13 @@ bool verifyAndStripCRC32(std::vector<uint8_t>& data) {
 // ============================================================
 // 量化编解码核心
 // ============================================================
-enum class ErrorType {
-    FileNotFound, FileReadError, FileWriteError,
-    ImageLoadError, ImageSaveError, ImageSizeError,
-    DataSizeError, FECError, UserAbort, InvalidInput, DamageExceeded
-};
-
-class QRACException : public std::runtime_error {
-public:
-    QRACException(ErrorType t, const std::string& m)
-        : std::runtime_error(m), m_type(t) {}
-    ErrorType getType() const { return m_type; }
-private:
-    ErrorType m_type;
-};
-
 int calculateIntervals(const QRACConfig& cfg) {
     int r = 256 - (cfg.FILLER_MAX_VALUE + 1);
     return r / cfg.L + (r % cfg.L ? 1 : 0);
 }
 bool isFillerValue(uint8_t v, const QRACConfig& cfg) { return v <= cfg.FILLER_MAX_VALUE; }
 bool isFillerPixel(const uint8_t* p, const QRACConfig& cfg) {
-    return isFillerValue(p[0],cfg) && isFillerValue(p[1],cfg) && isFillerValue(p[2],cfg);
+    return isFillerValue(p[0], cfg) && isFillerValue(p[1], cfg) && isFillerValue(p[2], cfg);
 }
 int calculateAnchor(int idx, const QRACConfig& cfg) {
     int s = cfg.FILLER_MAX_VALUE + 1 + idx * cfg.L;
@@ -378,13 +396,13 @@ int decodeToSymbol(uint8_t v, const QRACConfig& cfg) {
 
 // ---- 数据 ↔ 符号 转换链 ----
 std::vector<bool> dataToBinary(const std::vector<uint8_t>& data) {
-    std::vector<bool> bits; bits.reserve(data.size()*8);
+    std::vector<bool> bits; bits.reserve(data.size() * 8);
     for (uint8_t b : data)
-        for (int i = 7; i >= 0; --i) bits.push_back((b>>i)&1);
+        for (int i = 7; i >= 0; --i) bits.push_back((b >> i) & 1);
     return bits;
 }
 std::vector<int> binaryToSymbols(const std::vector<bool>& bits,
-                                  int bps, const QRACConfig& cfg) {
+    int bps, const QRACConfig& cfg) {
     int intervals = calculateIntervals(cfg);
     int n = (int)((bits.size() + bps - 1) / bps);
     std::vector<int> syms; syms.reserve(n);
@@ -392,19 +410,19 @@ std::vector<int> binaryToSymbols(const std::vector<bool>& bits,
         int sym = 0;
         for (int j = 0; j < bps; ++j) {
             int bi = i * bps + j;
-            sym = (sym<<1) | ((bi < (int)bits.size() && bits[bi]) ? 1 : 0);
+            sym = (sym << 1) | ((bi < (int)bits.size() && bits[bi]) ? 1 : 0);
         }
         syms.push_back(sym % intervals);
     }
     return syms;
 }
 std::vector<bool> symbolsToBinary(const std::vector<int>& syms,
-                                   int bps, size_t expectedBits) {
+    int bps, size_t expectedBits) {
     std::vector<bool> bits; bits.reserve(expectedBits);
     for (int sym : syms) {
         if (sym == -1) continue;
-        for (int i = bps-1; i >= 0; --i) {
-            bits.push_back((sym>>i)&1);
+        for (int i = bps - 1; i >= 0; --i) {
+            bits.push_back((sym >> i) & 1);
             if (bits.size() >= expectedBits) goto done;
         }
     }
@@ -413,11 +431,11 @@ done:
     return bits;
 }
 std::vector<uint8_t> binaryToData(const std::vector<bool>& bits) {
-    std::vector<uint8_t> data; data.reserve((bits.size()+7)/8);
+    std::vector<uint8_t> data; data.reserve((bits.size() + 7) / 8);
     for (size_t i = 0; i < bits.size(); i += 8) {
         uint8_t b = 0;
         for (int j = 0; j < 8; ++j)
-            b = (b<<1) | ((i+j < bits.size() && bits[i+j]) ? 1 : 0);
+            b = (b << 1) | ((i + j < bits.size() && bits[i + j]) ? 1 : 0);
         data.push_back(b);
     }
     return data;
@@ -426,10 +444,10 @@ std::vector<uint8_t> binaryToData(const std::vector<bool>& bits) {
 // ---- Header（含自校验和版本号）----
 std::vector<uint8_t> buildHeader(uint32_t dataSize, const QRACConfig& cfg) {
     std::vector<uint8_t> h(HEADER_BYTES, 0);
-    h[0]=dataSize&0xFF; h[1]=(dataSize>>8)&0xFF;
-    h[2]=(dataSize>>16)&0xFF; h[3]=(dataSize>>24)&0xFF;
-    h[4]=(uint8_t)cfg.L; h[5]=cfg.FILLER_MAX_VALUE;
-    h[6]=(uint8_t)(cfg.FEC_REDUNDANCY_RATIO*100.0f+0.5f);
+    h[0] = dataSize & 0xFF; h[1] = (dataSize >> 8) & 0xFF;
+    h[2] = (dataSize >> 16) & 0xFF; h[3] = (dataSize >> 24) & 0xFF;
+    h[4] = (uint8_t)cfg.L; h[5] = cfg.FILLER_MAX_VALUE;
+    h[6] = (uint8_t)(cfg.FEC_REDUNDANCY_RATIO * 100.0f + 0.5f);
     // byte 7: XOR checksum of bytes 0..6
     uint8_t ck = 0;
     for (int i = 0; i < 7; ++i) ck ^= h[i];
@@ -441,30 +459,30 @@ std::vector<uint8_t> buildHeader(uint32_t dataSize, const QRACConfig& cfg) {
 }
 
 struct DecodedHeader {
-    uint32_t dataSize=0; int L=5; uint8_t fillerMax=10;
-    float fecRatio=0.25f; int formatVer=0; bool valid=false;
+    uint32_t dataSize = 0; int L = 5; uint8_t fillerMax = 10;
+    float fecRatio = 0.25f; int formatVer = 0; bool valid = false;
 };
 
 DecodedHeader parseHeader(const uint8_t* img) {
     DecodedHeader dh;
-    dh.dataSize = (uint32_t)img[0]|((uint32_t)img[1]<<8)
-                |((uint32_t)img[2]<<16)|((uint32_t)img[3]<<24);
-    dh.L=std::max(1,(int)img[4]); dh.fillerMax=img[5];
-    dh.fecRatio=img[6]/100.0f;
+    dh.dataSize = (uint32_t)img[0] | ((uint32_t)img[1] << 8)
+        | ((uint32_t)img[2] << 16) | ((uint32_t)img[3] << 24);
+    dh.L = std::max(1, (int)img[4]); dh.fillerMax = img[5];
+    dh.fecRatio = img[6] / 100.0f;
     // 验证 XOR checksum
     uint8_t ck = 0;
     for (int i = 0; i < 7; ++i) ck ^= img[i];
     if (ck != img[7]) { dh.valid = false; return dh; }
     dh.formatVer = img[8];
     // 基础合法性检查
-    if (dh.L<=50 && dh.fillerMax<=200 && dh.dataSize<0x80000000u)
+    if (dh.L <= 50 && dh.fillerMax <= 200 && dh.dataSize < 0x80000000u)
         dh.valid = true;
     return dh;
 }
 
 QRACConfig configFromHeader(const DecodedHeader& dh) {
-    QRACConfig c; c.L=dh.L; c.FILLER_MAX_VALUE=dh.fillerMax;
-    c.FEC_REDUNDANCY_RATIO=dh.fecRatio; return c;
+    QRACConfig c; c.L = dh.L; c.FILLER_MAX_VALUE = dh.fillerMax;
+    c.FEC_REDUNDANCY_RATIO = dh.fecRatio; return c;
 }
 
 // ---- 最大符号数估算（编码前预检查用）----
@@ -478,7 +496,7 @@ std::vector<uint8_t> createQRACImage(
     const std::vector<int>& symbols, int w, int h,
     const QRACConfig& cfg, const std::vector<uint8_t>& header)
 {
-    int total = w*h, dataPx = total - HEADER_PIXELS - VERIFICATION_PIXELS;
+    int total = w * h, dataPx = total - HEADER_PIXELS - VERIFICATION_PIXELS;
     int maxSyms = dataPx * cfg.SYMBOLS_PER_PIXEL;
     if ((int)symbols.size() > maxSyms) {
         std::ostringstream oss;
@@ -487,48 +505,48 @@ std::vector<uint8_t> createQRACImage(
             << " (" << w << "x" << h << "), "
             << "suggested min side: "
             << std::max(cfg.MIN_IMAGE_DIMENSION,
-               (int)std::ceil(std::sqrt(
-                 (symbols.size() + cfg.SYMBOLS_PER_PIXEL - 1)
-                 / cfg.SYMBOLS_PER_PIXEL + HEADER_PIXELS + VERIFICATION_PIXELS)));
+                (int)std::ceil(std::sqrt(
+                    (symbols.size() + cfg.SYMBOLS_PER_PIXEL - 1)
+                    / cfg.SYMBOLS_PER_PIXEL + HEADER_PIXELS + VERIFICATION_PIXELS)));
         throw QRACException(ErrorType::ImageSizeError, oss.str());
     }
-    std::vector<uint8_t> img(total*3, 0);
-    for (int p=0; p<HEADER_PIXELS; ++p)
-        for (int ch=0; ch<3; ++ch) img[p*3+ch] = header[p*3+ch];
+    std::vector<uint8_t> img(total * 3, 0);
+    for (int p = 0; p < HEADER_PIXELS; ++p)
+        for (int ch = 0; ch < 3; ++ch) img[p * 3 + ch] = header[p * 3 + ch];
     int ds = HEADER_PIXELS;
-    for (size_t i=0; i<symbols.size(); ++i) {
-        int po = ds + (int)i/cfg.SYMBOLS_PER_PIXEL;
+    for (size_t i = 0; i < symbols.size(); ++i) {
+        int po = ds + (int)i / cfg.SYMBOLS_PER_PIXEL;
         int ch = (int)i % cfg.SYMBOLS_PER_PIXEL;
-        int row=po/w, col=po%w;
-        if (row>=h) break;
-        img[(row*w+col)*3+ch] = (uint8_t)calculateAnchor(symbols[i], cfg);
+        int row = po / w, col = po % w;
+        if (row >= h) break;
+        img[(row * w + col) * 3 + ch] = (uint8_t)calculateAnchor(symbols[i], cfg);
     }
-    int vs = (total-VERIFICATION_PIXELS)*3;
-    for (int i=0; i<VERIFICATION_PIXELS; ++i)
-        for (int ch=0; ch<3; ++ch) img[vs+i*3+ch] = VERIFICATION_COLORS[i][ch];
+    int vs = (total - VERIFICATION_PIXELS) * 3;
+    for (int i = 0; i < VERIFICATION_PIXELS; ++i)
+        for (int ch = 0; ch < 3; ++ch) img[vs + i * 3 + ch] = VERIFICATION_COLORS[i][ch];
     return img;
 }
 
 // ---- 损伤检测 ----
 bool checkVerificationPixels(const uint8_t* img, int w, int h, int chs,
-                              const QRACConfig& cfg) {
-    int total=w*h, vs=(total-VERIFICATION_PIXELS)*chs;
-    bool bad=false;
-    const char* names[]={"Red","Blue","Green","Yellow","White"};
+    const QRACConfig& cfg) {
+    int total = w * h, vs = (total - VERIFICATION_PIXELS) * chs;
+    bool bad = false;
+    const char* names[] = { "Red","Blue","Green","Yellow","White" };
     LOG("Verification pixel analysis:\n");
-    for (int i=0; i<VERIFICATION_PIXELS; ++i) {
-        int b=vs+i*chs, pixDmg=0;
-        for (int ch=0; ch<3; ++ch) {
-            int diff=std::abs((int)img[b+ch]-(int)VERIFICATION_COLORS[i][ch]);
-            pixDmg+=diff;
-            if (diff>(int)cfg.DAMAGE_THRESHOLD) {
+    for (int i = 0; i < VERIFICATION_PIXELS; ++i) {
+        int b = vs + i * chs, pixDmg = 0;
+        for (int ch = 0; ch < 3; ++ch) {
+            int diff = std::abs((int)img[b + ch] - (int)VERIFICATION_COLORS[i][ch]);
+            pixDmg += diff;
+            if (diff > (int)cfg.DAMAGE_THRESHOLD) {
                 std::ostringstream oss;
                 oss << "  " << names[i] << " ch" << ch << " damage=" << diff
                     << " (threshold=" << (int)cfg.DAMAGE_THRESHOLD << ")\n";
                 LOG(oss.str());
             }
         }
-        if (pixDmg>(int)cfg.DAMAGE_THRESHOLD*3) bad=true;
+        if (pixDmg > (int)cfg.DAMAGE_THRESHOLD * 3) bad = true;
     }
     std::ostringstream oss2;
     oss2 << "Cumulative threshold per pixel: " << (int)cfg.DAMAGE_THRESHOLD * 3 << "\n";
@@ -541,26 +559,26 @@ std::vector<uint8_t> extractRawDataFromImage(
     const uint8_t* img, int w, int h, int chs,
     const QRACConfig& cfg, bool& damageOk)
 {
-    damageOk = checkVerificationPixels(img,w,h,chs,cfg);
+    damageOk = checkVerificationPixels(img, w, h, chs, cfg);
     if (!damageOk) LOG("Warning: image damage exceeds threshold.\n");
-    int total=w*h, dataPx=total-HEADER_PIXELS-VERIFICATION_PIXELS;
-    int totalSyms=dataPx*cfg.SYMBOLS_PER_PIXEL;
-    int intervals=calculateIntervals(cfg), bps=(int)std::log2(intervals);
+    int total = w * h, dataPx = total - HEADER_PIXELS - VERIFICATION_PIXELS;
+    int totalSyms = dataPx * cfg.SYMBOLS_PER_PIXEL;
+    int intervals = calculateIntervals(cfg), bps = (int)std::log2(intervals);
     std::vector<int> syms; syms.reserve(totalSyms);
-    int ds=HEADER_PIXELS*chs, de=ds+dataPx*chs;
-    for (int i=ds; i<de; i+=chs) {
-        if (isFillerPixel(&img[i],cfg))
-            for (int ch=0; ch<cfg.SYMBOLS_PER_PIXEL; ++ch) syms.push_back(-1);
+    int ds = HEADER_PIXELS * chs, de = ds + dataPx * chs;
+    for (int i = ds; i < de; i += chs) {
+        if (isFillerPixel(&img[i], cfg))
+            for (int ch = 0; ch < cfg.SYMBOLS_PER_PIXEL; ++ch) syms.push_back(-1);
         else
-            for (int ch=0; ch<cfg.SYMBOLS_PER_PIXEL; ++ch)
-                syms.push_back(decodeToSymbol(img[i+ch],cfg));
+            for (int ch = 0; ch < cfg.SYMBOLS_PER_PIXEL; ++ch)
+                syms.push_back(decodeToSymbol(img[i + ch], cfg));
     }
     {
         std::ostringstream oss;
         oss << "Extracted symbols: " << syms.size() << "\n";
         LOG(oss.str());
     }
-    auto bits = symbolsToBinary(syms, bps, totalSyms*bps);
+    auto bits = symbolsToBinary(syms, bps, totalSyms * bps);
     {
         std::ostringstream oss;
         oss << "Extracted binary: " << bits.size() << " bits\n";
@@ -581,21 +599,21 @@ std::vector<uint8_t> extractDataLegacyFormat(
     const QRACConfig& cfg, bool& damageOk)
 {
     LOG("Trying legacy format (no header)...\n");
-    damageOk = checkVerificationPixels(img,w,h,chs,cfg);
+    damageOk = checkVerificationPixels(img, w, h, chs, cfg);
     if (!damageOk) LOG("Warning: image damage exceeds threshold.\n");
-    int total=w*h, dataPx=total-VERIFICATION_PIXELS;  // 旧格式没有 header 像素
-    int totalSyms=dataPx*cfg.SYMBOLS_PER_PIXEL;
-    int intervals=calculateIntervals(cfg), bps=(int)std::log2(intervals);
+    int total = w * h, dataPx = total - VERIFICATION_PIXELS;
+    int totalSyms = dataPx * cfg.SYMBOLS_PER_PIXEL;
+    int intervals = calculateIntervals(cfg), bps = (int)std::log2(intervals);
     std::vector<int> syms; syms.reserve(totalSyms);
-    int de=dataPx*chs;
-    for (int i=0; i<de; i+=chs) {
-        if (isFillerPixel(&img[i],cfg))
-            for (int ch=0; ch<cfg.SYMBOLS_PER_PIXEL; ++ch) syms.push_back(-1);
+    int de = dataPx * chs;
+    for (int i = 0; i < de; i += chs) {
+        if (isFillerPixel(&img[i], cfg))
+            for (int ch = 0; ch < cfg.SYMBOLS_PER_PIXEL; ++ch) syms.push_back(-1);
         else
-            for (int ch=0; ch<cfg.SYMBOLS_PER_PIXEL; ++ch)
-                syms.push_back(decodeToSymbol(img[i+ch],cfg));
+            for (int ch = 0; ch < cfg.SYMBOLS_PER_PIXEL; ++ch)
+                syms.push_back(decodeToSymbol(img[i + ch], cfg));
     }
-    auto bits = symbolsToBinary(syms, bps, totalSyms*bps);
+    auto bits = symbolsToBinary(syms, bps, totalSyms * bps);
     auto data = binaryToData(bits);
     LOG("Legacy format: extracted " << data.size() << " bytes\n");
     return data;
@@ -605,53 +623,42 @@ std::vector<uint8_t> extractDataLegacyFormat(
 // 工具函数
 // ============================================================
 std::string toLower(const std::string& s) {
-    std::string r=s; std::transform(r.begin(),r.end(),r.begin(),::tolower); return r;
+    std::string r = s; std::transform(r.begin(), r.end(), r.begin(), ::tolower); return r;
 }
 std::string getFileExtension(const std::string& fn) {
-    auto p=fn.find_last_of("."); return (p==std::string::npos)?"":fn.substr(p+1);
+    auto p = fn.find_last_of("."); return (p == std::string::npos) ? "" : fn.substr(p + 1);
 }
 std::string getDirectoryFromPath(const std::string& p) {
-    auto x=p.find_last_of("\\/"); return (x==std::string::npos)?"":p.substr(0,x+1);
+    auto x = p.find_last_of("\\/"); return (x == std::string::npos) ? "" : p.substr(0, x + 1);
 }
 std::string getFilenameWithoutPath(const std::string& p) {
-    auto x=p.find_last_of("\\/"); return (x==std::string::npos)?p:p.substr(x+1);
+    auto x = p.find_last_of("\\/"); return (x == std::string::npos) ? p : p.substr(x + 1);
 }
 std::string generateOutputFilename(const std::string& in,
-                                    const std::string& suffix,
-                                    const std::string& ext) {
-    std::string d=getDirectoryFromPath(in), n=getFilenameWithoutPath(in);
-    auto dot=n.find_last_of("."); if(dot!=std::string::npos) n=n.substr(0,dot);
-    return d+n+suffix+"."+ext;
+    const std::string& suffix,
+    const std::string& ext) {
+    std::string d = getDirectoryFromPath(in), n = getFilenameWithoutPath(in);
+    auto dot = n.find_last_of("."); if (dot != std::string::npos) n = n.substr(0, dot);
+    return d + n + suffix + "." + ext;
 }
 
-struct STBImageDeleter { void operator()(unsigned char* p) const { stbi_image_free(p); }};
+struct STBImageDeleter { void operator()(unsigned char* p) const { stbi_image_free(p); } };
 using STBImagePtr = std::unique_ptr<unsigned char, STBImageDeleter>;
 
+STBImagePtr loadImageSTB(const std::string& fn, int* w, int* h, int* c, int dc = 0) {
 #ifdef _WIN32
-std::wstring utf8ToWstring(const std::string& s) {
-    if(s.empty()) return {};
-    int len=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,nullptr,0);
-    if(!len) return {};
-    std::wstring ws(len,0);
-    MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,&ws[0],len);
-    return ws;
-}
-#endif
-
-STBImagePtr loadImageSTB(const std::string& fn, int* w, int* h, int* c, int dc=0) {
-#ifdef _WIN32
-    auto ws=utf8ToWstring(fn); FILE* f=_wfopen(ws.c_str(),L"rb");
-    if(!f) return nullptr;
-    auto* d=stbi_load_from_file(f,w,h,c,dc); fclose(f); return STBImagePtr(d);
+    auto ws = utf8ToWstring(fn); FILE* f = _wfopen(ws.c_str(), L"rb");
+    if (!f) return nullptr;
+    auto* d = stbi_load_from_file(f, w, h, c, dc); fclose(f); return STBImagePtr(d);
 #else
-    return STBImagePtr(stbi_load(fn.c_str(),w,h,c,dc));
+    return STBImagePtr(stbi_load(fn.c_str(), w, h, c, dc));
 #endif
 }
 
 STBImagePtr loadImageWithFallback(const std::string& fn, int* w, int* h, int* c) {
-    auto img=loadImageSTB(fn,w,h,c,0);
-    if(!img) img=loadImageSTB(fn,w,h,c,3);
-    if(!img) throw QRACException(ErrorType::ImageLoadError,"Failed to load image");
+    auto img = loadImageSTB(fn, w, h, c, 0);
+    if (!img) img = loadImageSTB(fn, w, h, c, 3);
+    if (!img) throw QRACException(ErrorType::ImageLoadError, "Failed to load image");
     return img;
 }
 
@@ -670,7 +677,8 @@ size_t getFileSize(const std::string& fn) {
 #else
         return fs::file_size(fn);
 #endif
-    } catch (...) {
+    }
+    catch (...) {
         throw QRACException(ErrorType::FileReadError, "Cannot get file size: " + fn);
     }
 }
@@ -716,28 +724,28 @@ std::string detectFileType(const std::vector<uint8_t>& data, const QRACConfig& c
     int pr = 0, ctrl = 0, nul = 0;
     for (size_t i = 0; i < n; ++i) {
         uint8_t c = data[i];
-        if ((c>=32&&c<=126)||c==9||c==10||c==13) ++pr;
-        else if (c==0) { ++nul; if (nul>(int)(n/20)) return "bin"; }
-        else if (c<32) { ++ctrl; if (ctrl>(int)(n/50)) return "bin"; }
+        if ((c >= 32 && c <= 126) || c == 9 || c == 10 || c == 13) ++pr;
+        else if (c == 0) { ++nul; if (nul > (int)(n / 20)) return "bin"; }
+        else if (c < 32) { ++ctrl; if (ctrl > (int)(n / 50)) return "bin"; }
         else ++pr;
     }
-    return ((float)pr/n > cfg.TEXT_DETECTION_THRESHOLD
-         && (float)ctrl/n < cfg.CONTROL_CHAR_THRESHOLD) ? "txt" : "bin";
+    return ((float)pr / n > cfg.TEXT_DETECTION_THRESHOLD
+        && (float)ctrl / n < cfg.CONTROL_CHAR_THRESHOLD) ? "txt" : "bin";
 }
 
 void saveExtractedData(const std::vector<uint8_t>& data,
-                        const std::string& fn, bool isText) {
+    const std::string& fn, bool isText) {
     atomicWriteFile(fn, data.data(), data.size(), !isText);
 }
 
 // ---- PNG 压缩 ----
 std::vector<uint8_t> compressPNG(const std::vector<uint8_t>& raw,
-                                  int w, int h, int chs) {
+    int w, int h, int chs) {
     extern int stbi_write_png_compression_level;
     int saved = stbi_write_png_compression_level;
     stbi_write_png_compression_level = 8;
     int outLen = 0;
-    unsigned char* png = stbi_write_png_to_mem(raw.data(), w*chs, w, h, chs, &outLen);
+    unsigned char* png = stbi_write_png_to_mem(raw.data(), w * chs, w, h, chs, &outLen);
     stbi_write_png_compression_level = saved;
     if (!png) throw QRACException(ErrorType::ImageSaveError, "PNG compression failed");
     std::vector<uint8_t> result(png, png + outLen);
@@ -747,12 +755,12 @@ std::vector<uint8_t> compressPNG(const std::vector<uint8_t>& raw,
 
 // ---- 自适应尺寸 ----
 void calculateAdaptiveDimensions(size_t dataSize, int* w, int* h,
-                                  const QRACConfig& cfg) {
-    size_t tb = dataSize + 4;  // +CRC
+    const QRACConfig& cfg) {
+    size_t tb = dataSize + 4;
     int intervals = calculateIntervals(cfg), bps = (int)std::log2(intervals);
     size_t ts = (tb * 8 + bps - 1) / bps;
     int pn = (int)((ts + cfg.SYMBOLS_PER_PIXEL - 1) / cfg.SYMBOLS_PER_PIXEL)
-           + HEADER_PIXELS + VERIFICATION_PIXELS;
+        + HEADER_PIXELS + VERIFICATION_PIXELS;
     int side = std::max((int)std::ceil(std::sqrt(pn)), cfg.MIN_IMAGE_DIMENSION);
     *w = side; *h = (pn + side - 1) / side;
     *w = std::max(*w, cfg.MIN_IMAGE_DIMENSION);
@@ -762,7 +770,6 @@ void calculateAdaptiveDimensions(size_t dataSize, int* w, int* h,
 }
 
 // ---- 通道归一化（decode/correct 共用）----
-// 返回归一化后的像素数据指针（可能重新分配），imgPtr 会被接管
 unsigned char* normalizeChannels(STBImagePtr& imgPtr, int w, int h, int& chs) {
     auto* img = imgPtr.get();
     if (chs >= 3) return img;
@@ -792,11 +799,11 @@ void encodeFile(const QRACConfig& cfg) {
     }
     LOG("Selected: " << inputFile << "\n");
 
-    // 大文件警告
     size_t fileSize = 0;
-    try { fileSize = getFileSize(inputFile); } catch (...) {}
+    try { fileSize = getFileSize(inputFile); }
+    catch (...) {}
     if (cfg.largeFileWarningMB > 0 && fileSize > cfg.largeFileWarningMB * 1024 * 1024) {
-        LOG("WARNING: File is " << (fileSize/(1024*1024)) << " MB.\n"
+        LOG("WARNING: File is " << (fileSize / (1024 * 1024)) << " MB.\n"
             << "Encoding may use significant memory. Continue? (y/n): ");
         char ch; std::cin >> ch;
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
@@ -840,25 +847,27 @@ void encodeFile(const QRACConfig& cfg) {
     int width = 0, height = 0;
     if (mode == "2") {
         calculateAdaptiveDimensions(dataSize, &width, &height, cfg);
-    } else {
+    }
+    else {
         size_t sz = fileData.size();
         if (sz <= cfg.SMALL_FILE_THRESHOLD) {
             width = height = cfg.DEFAULT_SMALL_SIZE;
-        } else if (sz <= cfg.MEDIUM_FILE_THRESHOLD) {
+        }
+        else if (sz <= cfg.MEDIUM_FILE_THRESHOLD) {
             width = height = cfg.DEFAULT_MEDIUM_SIZE;
-        } else {
+        }
+        else {
             width = height = cfg.DEFAULT_LARGE_SIZE;
         }
     }
     LOG("Image dimensions: " << width << "x" << height << "\n");
 
-    auto bits  = dataToBinary(fileData);
+    auto bits = dataToBinary(fileData);
     int intervals = calculateIntervals(cfg), bps = (int)std::log2(intervals);
     auto syms = binaryToSymbols(bits, bps, cfg);
     LOG("Symbols: " << syms.size()
         << " (intervals=" << intervals << ", bps=" << bps << ")\n");
 
-    // 预检查容量
     int maxSyms = maxSymbolsInImage(width, height, cfg);
     if ((int)syms.size() > maxSyms) {
         std::ostringstream oss;
@@ -868,7 +877,7 @@ void encodeFile(const QRACConfig& cfg) {
     }
 
     auto header = buildHeader(dataSize, cfg);
-    auto img    = createQRACImage(syms, width, height, cfg, header);
+    auto img = createQRACImage(syms, width, height, cfg, header);
 
     std::string defaultName = generateOutputFilename(inputFile, "_encoded", outFmt);
     std::string outPath = nativeSaveFileDialog(defaultName.c_str());
@@ -880,44 +889,44 @@ void encodeFile(const QRACConfig& cfg) {
     if (outFmt == "png") {
         auto png = compressPNG(img, width, height, 3);
         atomicWriteFile(outPath, png.data(), png.size());
-    } else {
-        // BMP 路径也用原子写入
-        std::vector<uint8_t> bmpBuf(width * height * 3);
-        // stbi_write_bmp 直接写文件，无法用内存缓冲 → 先写到 .tmp
+    }
+    else {
         std::string tmpPath = outPath + ".tmp";
         if (!stbi_write_bmp(tmpPath.c_str(), width, height, 3, img.data()))
             throw QRACException(ErrorType::ImageSaveError, "BMP save failed");
         std::error_code ec;
         fs::rename(tmpPath, outPath, ec);
         if (ec) {
-            try { fs::remove(tmpPath); } catch (...) {}
+            try { fs::remove(tmpPath); }
+            catch (...) {}
             throw QRACException(ErrorType::FileWriteError,
                 "Cannot finalize: " + outPath);
         }
     }
     LOG("QRAC image saved: " << outPath << "\n");
 
-    // 可选：往返验证
     if (cfg.verifyRoundtrip) {
         LOG("Roundtrip verification...\n");
-        int vw=0, vh=0, vch=0;
+        int vw = 0, vh = 0, vch = 0;
         auto vImg = loadImageWithFallback(outPath, &vw, &vh, &vch);
         auto* vpx = normalizeChannels(vImg, vw, vh, vch);
         DecodedHeader vdh = parseHeader(vpx);
         if (!vdh.valid) {
             LOG("  FAILED: Cannot parse header of encoded image\n");
-        } else {
+        }
+        else {
             QRACConfig vcfg = configFromHeader(vdh);
-            bool vDmg=false;
+            bool vDmg = false;
             auto vRaw = extractRawDataFromImage(vpx, vw, vh, vch, vcfg, vDmg);
             bool vCrc = verifyAndStripCRC32(vRaw);
             if (vCrc && vRaw.size() == dataSize &&
-                std::equal(fileData.begin(), fileData.begin()+std::min(dataSize,(uint32_t)vRaw.size()),
-                           vRaw.begin())) {
+                std::equal(fileData.begin(), fileData.begin() + std::min(dataSize, (uint32_t)vRaw.size()),
+                    vRaw.begin())) {
                 LOG("  PASSED: Roundtrip verification OK\n");
-            } else {
+            }
+            else {
                 LOG("  FAILED: Roundtrip mismatch (CRC="
-                    << (vCrc?"OK":"BAD") << ")\n");
+                    << (vCrc ? "OK" : "BAD") << ")\n");
             }
         }
     }
@@ -943,7 +952,7 @@ void decodeFile(const QRACConfig& defaultCfg) {
 
     int w = 0, h = 0, chs = 0;
     auto imgPtr = loadImageWithFallback(inputImage, &w, &h, &chs);
-    auto* img   = normalizeChannels(imgPtr, w, h, chs);
+    auto* img = normalizeChannels(imgPtr, w, h, chs);
     LOG("Loaded: " << w << "x" << h << " " << chs << "ch\n");
 
     DecodedHeader dh = parseHeader(img);
@@ -953,7 +962,6 @@ void decodeFile(const QRACConfig& defaultCfg) {
     uint32_t dataSize;
 
     if (dh.valid) {
-        // 新格式
         LOG("Header: dataSize=" << dh.dataSize << " L=" << dh.L
             << " fillerMax=" << (int)dh.fillerMax
             << " version=" << dh.formatVer << "\n");
@@ -963,8 +971,8 @@ void decodeFile(const QRACConfig& defaultCfg) {
         crcOk = verifyAndStripCRC32(raw);
         LOG((crcOk ? "OK" : "FAILED — data may be corrupted!") << "\n");
         dataSize = dh.dataSize;
-    } else {
-        // 旧格式回退
+    }
+    else {
         LOG("Header checksum invalid — trying legacy format...\n");
         LOG("Using default L=" << defaultCfg.L
             << " fillerMax=" << (int)defaultCfg.FILLER_MAX_VALUE << "\n");
@@ -978,7 +986,8 @@ void decodeFile(const QRACConfig& defaultCfg) {
         if (!sizeStr.empty()) {
             try { dataSize = (uint32_t)std::stoull(sizeStr); }
             catch (...) { dataSize = (uint32_t)raw.size(); }
-        } else {
+        }
+        else {
             dataSize = (uint32_t)raw.size();
         }
     }
@@ -1017,14 +1026,14 @@ void correctImageFile(const QRACConfig& defaultCfg) {
 
     int w = 0, h = 0, chs = 0;
     auto imgPtr = loadImageWithFallback(inputImage, &w, &h, &chs);
-    auto* img   = normalizeChannels(imgPtr, w, h, chs);
+    auto* img = normalizeChannels(imgPtr, w, h, chs);
 
     DecodedHeader dh = parseHeader(img);
     std::vector<uint8_t> raw;
     bool damageOk = false;
     bool crcOk = false;
     uint32_t dataSize;
-    QRACConfig imgCfg;  // 用于重新编码的配置
+    QRACConfig imgCfg;
 
     if (dh.valid) {
         LOG("Header: dataSize=" << dh.dataSize << " L=" << dh.L
@@ -1033,7 +1042,8 @@ void correctImageFile(const QRACConfig& defaultCfg) {
         imgCfg = configFromHeader(dh);
         raw = extractRawDataFromImage(img, w, h, chs, imgCfg, damageOk);
         dataSize = dh.dataSize;
-    } else {
+    }
+    else {
         LOG("Header checksum invalid — trying legacy format...\n");
         imgCfg = defaultCfg;
         LOG("Using default L=" << defaultCfg.L
@@ -1045,7 +1055,8 @@ void correctImageFile(const QRACConfig& defaultCfg) {
         if (!sizeStr.empty()) {
             try { dataSize = (uint32_t)std::stoull(sizeStr); }
             catch (...) { dataSize = (uint32_t)raw.size(); }
-        } else {
+        }
+        else {
             dataSize = (uint32_t)raw.size();
         }
     }
@@ -1068,11 +1079,10 @@ void correctImageFile(const QRACConfig& defaultCfg) {
     appendCRC32(raw);
 
     LOG("\nStep 2: Re-encoding with anchor values...\n");
-    auto bits  = dataToBinary(raw);
+    auto bits = dataToBinary(raw);
     int intervals = calculateIntervals(imgCfg), bps = (int)std::log2(intervals);
-    auto syms  = binaryToSymbols(bits, bps, imgCfg);
+    auto syms = binaryToSymbols(bits, bps, imgCfg);
 
-    // 预检查
     int maxSyms = maxSymbolsInImage(w, h, imgCfg);
     if ((int)syms.size() > maxSyms) {
         std::ostringstream oss;
@@ -1104,7 +1114,6 @@ void batchEncode(const QRACConfig& cfg) {
     }
     LOG("Folder: " << folder << "\n");
 
-    // 收集所有文件
     std::vector<std::string> files;
     try {
         for (const auto& entry : fs::directory_iterator(
@@ -1116,7 +1125,6 @@ void batchEncode(const QRACConfig& cfg) {
         )) {
             if (entry.is_regular_file()) {
 #ifdef _WIN32
-                // 宽字符路径转回 UTF-8
                 std::wstring wp = entry.path().wstring();
                 int len = WideCharToMultiByte(CP_UTF8, 0, wp.c_str(), -1, nullptr, 0, nullptr, nullptr);
                 std::string sp(len, 0);
@@ -1127,7 +1135,8 @@ void batchEncode(const QRACConfig& cfg) {
 #endif
             }
         }
-    } catch (...) {
+    }
+    catch (...) {
         throw QRACException(ErrorType::FileReadError, "Cannot read folder: " + folder);
     }
 
@@ -1149,13 +1158,13 @@ void batchEncode(const QRACConfig& cfg) {
     int success = 0, failed = 0;
     for (size_t idx = 0; idx < files.size(); ++idx) {
         const auto& fp = files[idx];
-        LOG("\n[" << (idx+1) << "/" << files.size() << "] "
+        LOG("\n[" << (idx + 1) << "/" << files.size() << "] "
             << getFilenameWithoutPath(fp) << "\n");
 
         try {
             size_t fs = getFileSize(fp);
             if (cfg.largeFileWarningMB > 0 && fs > cfg.largeFileWarningMB * 1024 * 1024) {
-                LOG("  SKIPPED: File too large (" << (fs/(1024*1024)) << " MB)\n");
+                LOG("  SKIPPED: File too large (" << (fs / (1024 * 1024)) << " MB)\n");
                 ++failed;
                 continue;
             }
@@ -1174,7 +1183,6 @@ void batchEncode(const QRACConfig& cfg) {
             appendCRC32(fileData);
 
             int w = 0, h = 0;
-            // 批量模式强制用自适应尺寸
             calculateAdaptiveDimensions(dataSize, &w, &h, cfg);
 
             auto bits = dataToBinary(fileData);
@@ -1193,18 +1201,20 @@ void batchEncode(const QRACConfig& cfg) {
             if (outFmt == "png") {
                 auto png = compressPNG(img, w, h, 3);
                 atomicWriteFile(outPath, png.data(), png.size());
-            } else {
+            }
+            else {
                 std::string tmpPath = outPath + ".tmp";
                 if (!stbi_write_bmp(tmpPath.c_str(), w, h, 3, img.data())) {
                     LOG("  SKIPPED: BMP write failed\n"); ++failed; continue;
                 }
                 std::error_code ec;
                 fs::rename(tmpPath, outPath, ec);
-                if (ec) { try { fs::remove(tmpPath); } catch(...) {} ++failed; continue; }
+                if (ec) { try { fs::remove(tmpPath); } catch (...) {} ++failed; continue; }
             }
             LOG("  -> " << getFilenameWithoutPath(outPath) << "\n");
             ++success;
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e) {
             LOG("  FAILED: " << e.what() << "\n");
             ++failed;
         }
@@ -1250,7 +1260,7 @@ void showSettings(QRACConfig& cfg) {
             << "8. DEFAULT_LARGE_SIZE             = " << cfg.DEFAULT_LARGE_SIZE << "\n"
             << "9. SMALL_FILE_THRESHOLD           = " << cfg.SMALL_FILE_THRESHOLD << "\n"
             << "10. MEDIUM_FILE_THRESHOLD         = " << cfg.MEDIUM_FILE_THRESHOLD << "\n"
-            << "11. Roundtrip verification        = " << (cfg.verifyRoundtrip?"ON":"OFF") << "\n"
+            << "11. Roundtrip verification        = " << (cfg.verifyRoundtrip ? "ON" : "OFF") << "\n"
             << "12. Large file warning threshold  = " << cfg.largeFileWarningMB << " MB\n"
             << "13. Save & Return\n"
             << "14. Return without saving\n"
@@ -1283,13 +1293,14 @@ void showSettings(QRACConfig& cfg) {
             case 11: cfg.verifyRoundtrip = (std::stoi(val) != 0); break;
             case 12: cfg.largeFileWarningMB = std::max(size_t(0), std::stoull(val)); break;
             }
-        } catch (...) { LOG("Invalid value.\n"); }
+        }
+        catch (...) { LOG("Invalid value.\n"); }
     }
 }
 
 void showMenu() {
     QRACConfig cfg;
-    loadConfig(cfg);     // 启动时读取持久化配置
+    loadConfig(cfg);
 
     showUserGuide();
     showTrustStatement();
@@ -1329,7 +1340,8 @@ void showMenu() {
             default:
                 LOG("Please select 1-8.\n");
             }
-        } catch (const QRACException& e) {
+        }
+        catch (const QRACException& e) {
             std::cerr << "Error: " << e.what() << "\n";
             LOG("Error: " << e.what() << "\n");
             switch (e.getType()) {
@@ -1345,7 +1357,8 @@ void showMenu() {
                 LOG("Cancelled.\n"); break;
             default: break;
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e) {
             std::cerr << "Unexpected error: " << e.what() << "\n";
             LOG("Unexpected error: " << e.what() << "\n");
         }
@@ -1359,13 +1372,14 @@ int main() {
     LOG("--- QRAC v" << QRAC_SOFTWARE_VER << " session: " << std::ctime(&t));
 
     std::cout << "QRAC Tool Suite - v" << QRAC_SOFTWARE_VER << "\n"
-              << "Format v" << QRAC_FORMAT_VERSION
-              << " | CRC32 + Header checksum + Atomic writes\n"
-              << "Single-file build, no extra dependencies\n\n";
+        << "Format v" << QRAC_FORMAT_VERSION
+        << " | CRC32 + Header checksum + Atomic writes\n"
+        << "Single-file build, no extra dependencies\n\n";
 
     try {
         showMenu();
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << "\nPress Enter to exit...";
         LOG("Fatal: " << e.what() << "\n");
         std::cin.get();
