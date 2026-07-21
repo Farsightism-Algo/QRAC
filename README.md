@@ -3,6 +3,7 @@ English | [简体中文](README_CN.md)
 
 Convert any file into a lossless image, and back.  
 Think of it as a visual data container with damage detection.
+
 Although this was not the original design intention, it has proved remarkably effective in circumventing regulation and content censorship.
 
 ## ✨ Features
