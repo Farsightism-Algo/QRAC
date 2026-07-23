@@ -142,5 +142,11 @@ MIT — 详见 [LICENSE](LICENSE)。
 
 ## 👤 作者
 
-**陈薛皓宇 (Xuehaoyu Chen)**  
+**Xuehaoyu Chen**  
 GitHub: [@sans666VIP](https://github.com/sans666VIP)
+### 隐私声明
+
+本仓库中的作者姓名仅用于 MIT 许可证所要求的版权声明。
+未经本人明确授权，任何人不得将该姓名用于身份关联、信息整合、网络搜索，
+或任何其他与版权声明无关的目的。
+
