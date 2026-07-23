@@ -14,8 +14,14 @@
     <ClCompile Include="QRAC.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="miniz.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="miniz.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="stb_image.h">
       <Filter>头文件</Filter>
     </ClInclude>
