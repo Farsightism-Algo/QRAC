@@ -142,5 +142,5 @@ MIT — 详见 [LICENSE](LICENSE)。
 
 ## 👤 作者
 
-**陈学浩 (Xuehaoyu Chen)**  
+**陈薛皓宇 (Xuehaoyu Chen)**  
 GitHub: [@sans666VIP](https://github.com/sans666VIP)
