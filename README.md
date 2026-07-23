@@ -136,6 +136,13 @@ This is the same situation faced by many legitimate system tools such as [No!! M
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE).
+### Acknowledgments
+
+If you integrate or reference QRAC code in your project, you are welcome to let the author know through either of the following ways:
+- Send an email to vip10338848@Gamil.com <sub>(The author does not check this email address very often.)</sub>
+- Submit an issue in the GitHub repository
+
+This request is not part of the MIT License, does not constitute a legal obligation, and is made purely out of personal preference.
 
 ## 👤 Author
 
